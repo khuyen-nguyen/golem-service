@@ -1,23 +1,51 @@
 package main
 
 import (
-	log "github.com/sirupsen/logrus"
-
 	"fmt"
 	"io/ioutil"
 	"os"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 )
 
+func allowedCommandPatterns() []string {
+	return []string{
+		"bash",
+		"sh",
+		"python.*",
+		"bundle exec rails .*",
+		"bundle exec rake .*",
+		"npm .*",
+		"yarn .*",
+	}
+}
+
+func isAllowedCommand(command string) bool {
+	for _, allowedPattern := range allowedCommandPatterns() {
+		match, _ := regexp.MatchString(allowedPattern, command)
+		if match { return true }
+	}
+	return false
+}
+
 func runSsh(envVars map[string]string, _ func(int)) error {
+	sshCommand := os.Getenv("SSH_ORIGINAL_COMMAND")
 	shellWrapper := "/bin/shell-wrapper.sh"
 	port := os.Getenv("SSH_PORT")
 	homeDir := "/app"
 	authorizedPublicKey := os.Getenv("AUTHORIZED_PUBLIC_KEY")
+	needUnlockRoot := os.Getenv("UNLOCK_ROOT") == "1"
+
+	if !isAllowedCommand(sshCommand) {
+		log.Infoln("Executing command is not allowed.")
+		return fmt.Errorf("Executing command is not allowed.")
+	}
 
 	if port == "" || authorizedPublicKey == "" {
 		log.Infoln("Missing SSH_PORT or AUTHORIZED_PUBLIC_KEY.")
@@ -33,7 +61,8 @@ func runSsh(envVars map[string]string, _ func(int)) error {
 			!strings.HasPrefix(value, "AUTHORIZED_PUBLIC_KEY=") &&
 			!strings.HasPrefix(value, "SSH_PORT=") &&
 			!strings.HasPrefix(value, "_") {
-			systemEnvs = append(systemEnvs, value)
+			key, val, _ := strings.Cut(value, "=")
+			systemEnvs = append(systemEnvs, fmt.Sprintf("%s=%s", key, strconv.Quote(val)))
 		}
 	}
 
@@ -71,16 +100,20 @@ func runSsh(envVars map[string]string, _ func(int)) error {
 		return err
 	}
 
-	cmd = exec.Command("passwd", "-u", "root")
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
-		log.Debugf("Failed to start [passwd -u root]: %+v\n", err)
-		return err
-	}
-	if err := cmd.Wait(); err != nil {
-		log.Debugf("Failed to run [passwd -u root]: %+v\n", err)
-		return err
+	if needUnlockRoot {
+		cmd = exec.Command("passwd", "-u", "root")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Start(); err != nil {
+			log.Debugf("Failed to start [passwd -u root]: %+v\n", err)
+			return err
+		}
+		if err := cmd.Wait(); err != nil {
+			log.Debugf("Failed to run [passwd -u root]: %+v\n", err)
+			return err
+		}
+	} else {
+		log.Debugf("Bypass unlock root")
 	}
 
 	_, err = os.Stat("/etc/pam.d/sshd")
@@ -112,7 +145,6 @@ func runSsh(envVars map[string]string, _ func(int)) error {
 		0600)
 
 	customSshdConfigTemplate := `
-RSAAuthentication yes
 PubkeyAuthentication yes
 PasswordAuthentication no
 ForceCommand %s
@@ -165,20 +197,7 @@ set -a
 
 set +a
 set +e
-command="/bin/bash --login"
-if [[ -n "${SSH_ORIGINAL_COMMAND}" ]]; then
-  # TODO: [AV] Support configurable commands
-  if [[ $SSH_ORIGINAL_COMMAND == "bundle exec rake "* ]] ||
-  	[[ $SSH_ORIGINAL_COMMAND == "bundle exec rails "* ]] ||
-  	[[ $SSH_ORIGINAL_COMMAND == "npm "* ]] ||
-  	[[ $SSH_ORIGINAL_COMMAND == "yarn "* ]]; then
-    command=${SSH_ORIGINAL_COMMAND}
-  else
-    echo "Command ${SSH_ORIGINAL_COMMAND} is not supported."
-    kill -s SIGTERM ` + "`" + `cat /var/golem-sshd.pid` + "`" + `
-    exit 1
-  fi
-fi
+command=${SSH_ORIGINAL_COMMAND}
 # -q            for silent "script"'s messages
 # -e            returns command exit code to caller
 # /proc/1/fd/1  main process' output, to awslog
